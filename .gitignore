@@ -1,0 +1,8 @@
+.env
+serviceAccountKey.json
+*.json
+__pycache__/
+*.pyc
+venv/
+node_modules/
+firebase.js
