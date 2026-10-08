@@ -34,7 +34,6 @@ app.add_middleware(
 # =============================================================
 # 2. FIREBASE & GEMINI CLIENT INITIALIZATION
 # =============================================================
-# Read credentials from environment variables (configured in Render)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 FIREBASE_SERVICE_ACCOUNT = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
 FIREBASE_STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "")
@@ -46,14 +45,11 @@ client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 if not firebase_admin._apps:
     if FIREBASE_SERVICE_ACCOUNT:
         if os.path.exists(FIREBASE_SERVICE_ACCOUNT):
-            # If path to file is provided
             cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT)
         else:
-            # If full JSON string is pasted into Render environment variables
             cred_dict = json.loads(FIREBASE_SERVICE_ACCOUNT)
             cred = credentials.Certificate(cred_dict)
     elif os.path.exists("serviceAccountKey.json"):
-        # Local development fallback file
         cred = credentials.Certificate("serviceAccountKey.json")
     else:
         cred = None
@@ -74,6 +70,10 @@ class WorkExperience(BaseModel):
     company: str = Field(description="Company or organization name")
     duration: str = Field(description="Dates or duration of employment")
 
+class ProjectInfo(BaseModel):
+    title: str = Field(description="Project title or name")
+    description: str = Field(description="Brief overview, technologies used, or outcome of the project")
+
 class CandidateProfile(BaseModel):
     name: str = Field(description="Full name of candidate")
     email: Optional[str] = Field(default="", description="Email address")
@@ -84,13 +84,38 @@ class CandidateProfile(BaseModel):
     skills: List[str] = Field(description="List of technical and hard skills")
     years_of_experience: float = Field(description="Total professional years of experience as a float")
     work_history: List[WorkExperience] = Field(default=[], description="Past work history entries")
+    
+    # Portfolio, Projects & Extracurriculars
+    linkedin: Optional[str] = Field(default="", description="LinkedIn profile URL")
+    github: Optional[str] = Field(default="", description="GitHub profile URL or username")
+    languages: List[str] = Field(default=[], description="Spoken and written languages")
+    projects: List[ProjectInfo] = Field(default=[], description="Academic, personal, or open-source projects")
+    leadership_activities: List[str] = Field(default=[], description="Co-curricular activities, leadership roles, or volunteering")
+    awards: List[str] = Field(default=[], description="Competitions, scholarships, honors, or awards")
+
+class CandidateUpdate(BaseModel):
+    name: str
+    email: str = ""
+    phone: str = ""
+    location: str
+    education_level: str
+    highest_education: str
+    skills: List[str] = Field(default=[])
+    work_history: List[WorkExperience] = Field(default=[])
+    years_of_experience: float
+    linkedin: Optional[str] = ""
+    github: Optional[str] = ""
+    languages: List[str] = Field(default=[])
+    projects: List[ProjectInfo] = Field(default=[])
+    leadership_activities: List[str] = Field(default=[])
+    awards: List[str] = Field(default=[])
 
 class CandidateEvaluation(BaseModel):
     name: str = Field(description="Full name of candidate")
     match_level: Literal["High", "Medium", "Low"] = Field(description="Overall categorical alignment")
     fit_score: int = Field(description="Suitability rating from 0 to 100")
     education_fit: str = Field(description="Assessment of degree and qualification relevance")
-    key_strengths: List[str] = Field(description="Specific matching qualifications and skills")
+    key_strengths: List[str] = Field(description="Specific matching qualifications, skills, and standout projects/awards")
     gaps_or_risks: List[str] = Field(description="Missing requirements or qualification gaps")
     recommendation: str = Field(description="Actionable decision: e.g. 'Fast-track to interview', 'Reject'")
 
@@ -107,7 +132,7 @@ You are an expert HR Talent Acquisition Specialist and Senior Technical Recruite
 Rules:
 1. Always normalize 'education_level' strictly into: 'High School', 'Diploma', 'Bachelor', 'Master', or 'PhD'.
 2. Aggregate work history durations accurately into 'years_of_experience' as a float.
-3. Be strictly factual; never hallucinate or assume unstated skills.
+3. Be strictly factual; never hallucinate unstated skills, projects, or achievements.
 4. When evaluating candidates against job requirements, strictly check hard criteria (required skills, minimum experience years, education).
 """
 
@@ -163,7 +188,7 @@ async def upload_and_parse_resume(file: UploadFile = File(...)):
 
         response = client.models.generate_content(
             model="gemini-3.5-flash-lite",
-            contents=[uploaded_doc, "Analyze this resume and extract candidate profile details."],
+            contents=[uploaded_doc, "Analyze this resume and extract candidate profile details, projects, awards, and portfolios."],
             config=config
         )
 
@@ -201,10 +226,34 @@ async def upload_and_parse_resume(file: UploadFile = File(...)):
             os.remove(temp_path)
 
 
+@app.put("/api/candidates/{candidate_id}")
+async def update_candidate(candidate_id: str, payload: CandidateUpdate):
+    """Updates recruiter-corrected profile fields in the candidates collection."""
+    if not db:
+        raise HTTPException(status_code=500, detail="Firebase is not initialized.")
+
+    candidate_ref = db.collection("candidates").document(candidate_id)
+    if not candidate_ref.get().exists:
+        raise HTTPException(status_code=404, detail="Candidate not found.")
+
+    candidate_ref.update({
+        **payload.model_dump(),
+        "updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+
+    return {
+        "status": "success",
+        "message": "Candidate profile updated successfully.",
+        "candidate_id": candidate_id,
+        "data": payload.model_dump(),
+    }
+
+
 @app.post("/api/find-candidates")
 def find_candidates_endpoint(payload: SearchRequest):
     """
     Evaluates candidate profiles against an HR query and outputs structured JSON fit evaluations.
+    Takes into account skills, work history, relevant projects, github/linkedin, and awards.
     """
     if not client:
         raise HTTPException(status_code=500, detail="Gemini client is not initialized.")
@@ -228,10 +277,14 @@ Candidate Pool:
 {json.dumps(payload.candidate_pool, indent=2)}
 
 Task:
-1. Extract explicit must-have requirements (skills, minimum experience, education).
+1. Extract explicit must-have requirements (skills, minimum experience, education, languages).
 2. Objectively score and evaluate EVERY candidate in the candidate pool.
 3. Compute a realistic fit_score (0-100) and assign High/Medium/Low match_level.
-4. Highlight concrete strengths and specific gaps.
+4. When evaluating strengths and calculating fit_score, consider:
+   - Relevance and complexity of candidate projects.
+   - GitHub or portfolio evidence demonstrating the required skills.
+   - Relevant honors, awards, leadership activities, or languages.
+5. Highlight concrete strengths and specific gaps.
 """
 
         response = client.models.generate_content(
