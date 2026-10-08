@@ -253,7 +253,7 @@ async def update_candidate(candidate_id: str, payload: CandidateUpdate):
 def find_candidates_endpoint(payload: SearchRequest):
     """
     Evaluates candidate profiles against an HR query and outputs structured JSON fit evaluations.
-    Takes into account skills, work history, relevant projects, github/linkedin, and awards.
+    Strictly filters out candidates who do not meet mandatory hard criteria.
     """
     if not client:
         raise HTTPException(status_code=500, detail="Gemini client is not initialized.")
@@ -264,7 +264,7 @@ def find_candidates_endpoint(payload: SearchRequest):
     try:
         config = types.GenerateContentConfig(
             system_instruction=SYSTEM_HR_INSTRUCTION,
-            temperature=0.1,
+            temperature=0.0,  # Set to 0.0 to eliminate creative leeway / leniency
             response_mime_type="application/json",
             response_schema=SourcingEvaluationResult,
         )
@@ -277,14 +277,15 @@ Candidate Pool:
 {json.dumps(payload.candidate_pool, indent=2)}
 
 Task:
-1. Extract explicit must-have requirements (skills, minimum experience, education, languages).
-2. Objectively score and evaluate EVERY candidate in the candidate pool.
-3. Compute a realistic fit_score (0-100) and assign High/Medium/Low match_level.
-4. When evaluating strengths and calculating fit_score, consider:
-   - Relevance and complexity of candidate projects.
-   - GitHub or portfolio evidence demonstrating the required skills.
-   - Relevant honors, awards, leadership activities, or languages.
-5. Highlight concrete strengths and specific gaps.
+1. Identify the MANDATORY (non-negotiable) hard requirements from the query (e.g., specific programming languages, technical skills, degree level).
+2. HARD FILTER / ELIMINATION RULE:
+   - If a candidate completely lacks the mandatory technical skill (e.g., the query requires C++, but the candidate has only Business/Finance skills and zero C++ experience), DO NOT INCLUDE THEM in the `evaluations` list.
+   - Do NOT lower the hiring standard just because the candidate pool is small.
+   - It is completely acceptable to return an empty `evaluations: []` list if no candidates meet the minimum baseline.
+3. For candidates who DO possess the baseline skills:
+   - Compute a realistic fit_score (0-100) and assign High, Medium, or Low match_level.
+   - Consider relevant projects, work history, awards, and portfolios.
+   - Highlight concrete strengths and gaps.
 """
 
         response = client.models.generate_content(
@@ -293,7 +294,16 @@ Task:
             config=config
         )
 
-        return json.loads(response.text)
+        result = json.loads(response.text)
+
+        # Optional Code-level safety guard:
+        # Strip out any candidate that scored below 40 or was marked Low despite the prompt
+        result["evaluations"] = [
+            cand for cand in result.get("evaluations", [])
+            if cand.get("match_level") in ["High", "Medium"] and cand.get("fit_score", 0) >= 40
+        ]
+
+        return result
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Candidate matching error: {str(e)}")
