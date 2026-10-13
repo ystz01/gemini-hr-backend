@@ -8,7 +8,7 @@ load_dotenv()
 from datetime import datetime
 from typing import List, Optional, Literal
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, Header, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -16,24 +16,20 @@ from google import genai
 from google.genai import types
 
 import firebase_admin
-from firebase_admin import credentials, firestore, storage
+from firebase_admin import auth as firebase_auth, credentials, firestore, storage
 
-# =============================================================
 # 1. APPLICATION & CORS SETUP
-# =============================================================
 app = FastAPI(title="Gemini HR Agent API", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust to your frontend domain in production
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =============================================================
 # 2. FIREBASE & GEMINI CLIENT INITIALIZATION
-# =============================================================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 FIREBASE_SERVICE_ACCOUNT = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
 FIREBASE_STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "")
@@ -62,9 +58,7 @@ if not firebase_admin._apps:
 db = firestore.client() if firebase_admin._apps else None
 bucket = storage.bucket() if firebase_admin._apps else None
 
-# =============================================================
 # 3. PYDANTIC SCHEMAS
-# =============================================================
 class WorkExperience(BaseModel):
     role: str = Field(description="Job title or designation")
     company: str = Field(description="Company or organization name")
@@ -127,18 +121,115 @@ class SearchRequest(BaseModel):
     query: str
     candidate_pool: List[dict]
 
-SYSTEM_HR_INSTRUCTION = """
+class UserAccountRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+    role: str
+
+# HELPER FUNCTIONS
+def get_hr_instruction():
+    """Generates prompt with current date so Gemini calculates 'Present' experience correctly."""
+    current_date = datetime.utcnow().strftime("%B %Y")
+    return f"""
 You are an expert HR Talent Acquisition Specialist and Senior Technical Recruiter.
+Today's date is {current_date}. 
 Rules:
 1. Always normalize 'education_level' strictly into: 'High School', 'Diploma', 'Bachelor', 'Master', or 'PhD'.
-2. Aggregate work history durations accurately into 'years_of_experience' as a float.
+2. Aggregate work history durations accurately into 'years_of_experience' as a float. Use today's date for 'Present' roles.
 3. Be strictly factual; never hallucinate unstated skills, projects, or achievements.
 4. When evaluating candidates against job requirements, strictly check hard criteria (required skills, minimum experience years, education).
 """
 
-# =============================================================
+def clean_json_response(raw_text: str) -> dict:
+    """Strips Markdown backticks if Gemini accidentally includes them, preventing JSONDecodeError."""
+    text = raw_text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    
+    if text.endswith("```"):
+        text = text[:-3]
+        
+    return json.loads(text.strip())
+
+
 # 4. API ENDPOINTS
-# =============================================================
+def require_super_admin(authorization: Optional[str]) -> dict:
+    if not db or not firebase_admin._apps:
+        raise HTTPException(status_code=500, detail="Firebase is not initialized.")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authentication is required.")
+
+    try:
+        token = firebase_auth.verify_id_token(authorization[7:])
+    except Exception as error:
+        raise HTTPException(status_code=401, detail="Invalid authentication token.") from error
+
+    if token.get("email") == "superadmin@centific.com":
+        return token
+
+    profile = db.collection("users").document(token["uid"]).get()
+    profile_data = profile.to_dict() if profile.exists else {}
+    if profile_data.get("role") == "Super Admin" or profile_data.get("roles") == "Super Admin":
+        return token
+
+    raise HTTPException(status_code=403, detail="Super Admin access is required.")
+
+
+@app.post("/api/users")
+def create_user_account(
+    payload: UserAccountRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    require_super_admin(authorization)
+    if len(payload.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+
+    try:
+        account = firebase_auth.create_user(
+            email=payload.email.strip().lower(),
+            password=payload.password,
+            display_name=payload.name.strip(),
+        )
+        db.collection("users").document(account.uid).set({
+            "name": payload.name.strip(),
+            "email": payload.email.strip().lower(),
+            "roles": payload.role,
+        })
+        return {"id": account.uid}
+    except Exception as error:
+        raise HTTPException(status_code=400, detail="Unable to create the user account.") from error
+
+
+# Converted to path parameter so frontend fetch() calls don't crash when passing a body.
+@app.delete("/api/users/{user_id}")
+def delete_user_account(
+    user_id: str,
+    email: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None),
+):
+    require_super_admin(authorization)
+    uid = user_id
+
+    try:
+        firebase_auth.get_user(uid)
+    except firebase_auth.UserNotFoundError:
+        if not email:
+            raise HTTPException(status_code=404, detail="User account was not found.")
+        try:
+            uid = firebase_auth.get_user_by_email(email).uid
+        except firebase_auth.UserNotFoundError as error:
+            raise HTTPException(status_code=404, detail="User account was not found.") from error
+
+    firebase_auth.delete_user(uid)
+    db.collection("users").document(user_id).delete()
+    if uid != user_id:
+        db.collection("users").document(uid).delete()
+    return {"id": uid}
+
+
 @app.get("/")
 def health_check():
     return {
@@ -151,11 +242,6 @@ def health_check():
 
 @app.post("/api/upload-and-parse-resume")
 async def upload_and_parse_resume(file: UploadFile = File(...)):
-    """
-    1. Saves uploaded resume to Firebase Storage.
-    2. Uses Gemini 3.8 Flash to extract structured candidate JSON.
-    3. Persists document into Firestore 'candidates' collection with resume_url.
-    """
     if not client:
         raise HTTPException(status_code=500, detail="Gemini client is not initialized. Check GEMINI_API_KEY.")
     if not db or not bucket:
@@ -170,17 +256,15 @@ async def upload_and_parse_resume(file: UploadFile = File(...)):
         temp_path = temp_file.name
 
     try:
-        # A. Upload original file to Firebase Storage
         blob = bucket.blob(storage_blob_path)
         blob.upload_from_filename(temp_path, content_type=file.content_type)
         blob.make_public()
         resume_url = blob.public_url
 
-        # B. Parse resume with Gemini Multimodal File API
         uploaded_doc = client.files.upload(file=temp_path)
 
         config = types.GenerateContentConfig(
-            system_instruction=SYSTEM_HR_INSTRUCTION,
+            system_instruction=get_hr_instruction(), # FIX 2: Dynamic date injected
             temperature=0.0,
             response_mime_type="application/json",
             response_schema=CandidateProfile,
@@ -192,9 +276,9 @@ async def upload_and_parse_resume(file: UploadFile = File(...)):
             config=config
         )
 
-        candidate_data = json.loads(response.text)
+        # Safe JSON parsing
+        candidate_data = clean_json_response(response.text)
 
-        # C. Attach storage and metadata tracking
         candidate_data["candidate_id"] = candidate_id
         candidate_data["resume_url"] = resume_url
         candidate_data["resume_storage_path"] = storage_blob_path
@@ -202,10 +286,8 @@ async def upload_and_parse_resume(file: UploadFile = File(...)):
         candidate_data["created_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         candidate_data["status"] = "active"
 
-        # D. Save directly to Firestore 'candidates' collection
         db.collection("candidates").document(candidate_id).set(candidate_data)
 
-        # Clean up temporary Gemini uploaded file reference
         try:
             client.files.delete(name=uploaded_doc.name)
         except Exception:
@@ -228,7 +310,6 @@ async def upload_and_parse_resume(file: UploadFile = File(...)):
 
 @app.put("/api/candidates/{candidate_id}")
 async def update_candidate(candidate_id: str, payload: CandidateUpdate):
-    """Updates recruiter-corrected profile fields in the candidates collection."""
     if not db:
         raise HTTPException(status_code=500, detail="Firebase is not initialized.")
 
@@ -251,10 +332,6 @@ async def update_candidate(candidate_id: str, payload: CandidateUpdate):
 
 @app.post("/api/find-candidates")
 def find_candidates_endpoint(payload: SearchRequest):
-    """
-    Evaluates candidate profiles against an HR query and outputs structured JSON fit evaluations.
-    Strictly filters out candidates who do not meet mandatory hard criteria.
-    """
     if not client:
         raise HTTPException(status_code=500, detail="Gemini client is not initialized.")
 
@@ -263,8 +340,8 @@ def find_candidates_endpoint(payload: SearchRequest):
 
     try:
         config = types.GenerateContentConfig(
-            system_instruction=SYSTEM_HR_INSTRUCTION,
-            temperature=0.0,  # Set to 0.0 to eliminate creative leeway / leniency
+            system_instruction=get_hr_instruction(), # FIX 2: Dynamic date injected
+            temperature=0.0, 
             response_mime_type="application/json",
             response_schema=SourcingEvaluationResult,
         )
@@ -294,10 +371,9 @@ Task:
             config=config
         )
 
-        result = json.loads(response.text)
+        # Safe JSON parsing
+        result = clean_json_response(response.text)
 
-        # Optional Code-level safety guard:
-        # Strip out any candidate that scored below 40 or was marked Low despite the prompt
         result["evaluations"] = [
             cand for cand in result.get("evaluations", [])
             if cand.get("match_level") in ["High", "Medium"] and cand.get("fit_score", 0) >= 40
