@@ -335,7 +335,13 @@ def find_candidates_endpoint(payload: SearchRequest):
     if not client:
         raise HTTPException(status_code=500, detail="Gemini client is not initialized.")
 
-    if not payload.candidate_pool:
+    active_candidate_pool = [
+        candidate for candidate in payload.candidate_pool
+        if isinstance(candidate.get("status"), str)
+        and candidate["status"].strip().lower() == "active"
+    ]
+
+    if not active_candidate_pool:
         return {"query_summary": "Empty candidate pool", "evaluations": []}
 
     try:
@@ -351,7 +357,7 @@ Job Requirement / Sourcing Query:
 "{payload.query}"
 
 Candidate Pool:
-{json.dumps(payload.candidate_pool, indent=2)}
+{json.dumps(active_candidate_pool, indent=2)}
 
 Task:
 1. Identify the MANDATORY (non-negotiable) hard requirements from the query (e.g., specific programming languages, technical skills, degree level).
