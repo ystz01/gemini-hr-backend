@@ -1,0 +1,76 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isSuperAdminEmail() {
+      return signedIn()
+        && request.auth.token.email == 'superadmin@centific.com';
+    }
+
+    function hasRole(role) {
+      return signedIn()
+        && (
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.roles == role
+          || get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == role
+        );
+    }
+
+    function isAdmin() {
+      return isSuperAdminEmail() || hasRole('Super Admin');
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn()
+        && (isAdmin() || request.auth.uid == userId);
+      allow create: if signedIn()
+        && (isAdmin() || request.auth.uid == userId);
+      allow update: if signedIn()
+        && (isAdmin() || request.auth.uid == userId);
+      allow delete: if isAdmin();
+    }
+
+    match /job_position/{jobId} {
+      allow read: if signedIn();
+      allow create, update, delete: if isAdmin() || hasRole('Hiring Manager');
+    }
+
+    match /candidates/{candidateId} {
+      // Candidate profiles are available to authenticated recruiting users.
+      allow read: if signedIn();
+      // Resume parsing writes through the Render Admin SDK, which bypasses
+      // client Firestore rules. These permissions cover trusted client edits.
+      allow create, update: if isAdmin() || hasRole('Recruiter') || hasRole('Hiring Manager') || hasRole('Department Manager');
+      allow delete: if isAdmin();
+    }
+
+    match /shortlisted_pool/{shortlistedId} {
+      allow read: if signedIn();
+      // Recruiters create shortlist records from AI Matching.
+      allow create: if isAdmin() || hasRole('Recruiter') || hasRole('Hiring Manager');
+      // Hiring managers make the final approval/rejection decision.
+      allow update: if isAdmin() || hasRole('Hiring Manager');
+      allow delete: if isAdmin();
+    }
+
+    match /interviews/{interviewId} {
+      allow read: if signedIn();
+      allow create: if isAdmin() || hasRole('Hiring Manager') || hasRole('Recruiter');
+      allow update: if isAdmin() || hasRole('Hiring Manager') || hasRole('Recruiter');
+      allow delete: if isAdmin();
+    }
+
+    match /hiring_matrix/{matrixId} {
+      allow read: if signedIn();
+      allow create: if isAdmin() || hasRole('Hiring Manager');
+      allow update: if isAdmin() || hasRole('Hiring Manager') || hasRole('Department Manager');
+      allow delete: if isAdmin();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

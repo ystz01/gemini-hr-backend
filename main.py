@@ -245,26 +245,29 @@ async def upload_and_parse_resume(file: UploadFile = File(...)):
     if not client:
         raise HTTPException(status_code=500, detail="Gemini client is not initialized. Check GEMINI_API_KEY.")
     if not db or not bucket:
-        raise HTTPException(status_code=500, detail="Firebase is not initialized. Check Firebase environment variables.")
+        raise HTTPException(status_code=500, detail="Firebase is not initialized.")
 
-    candidate_id = str(uuid.uuid4())
+    # We temporarily use a random UUID for the storage file name to avoid file overwriting conflicts
+    temp_storage_id = str(uuid.uuid4())
     file_ext = os.path.splitext(file.filename)[-1].lower()
-    storage_blob_path = f"resumes/{candidate_id}_{file.filename}"
+    storage_blob_path = f"resumes/{temp_storage_id}_{file.filename}"
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
         shutil.copyfileobj(file.file, temp_file)
         temp_path = temp_file.name
 
     try:
+        # A. Upload original file to Firebase Storage
         blob = bucket.blob(storage_blob_path)
         blob.upload_from_filename(temp_path, content_type=file.content_type)
         blob.make_public()
         resume_url = blob.public_url
 
+        # B. Parse resume with Gemini
         uploaded_doc = client.files.upload(file=temp_path)
 
         config = types.GenerateContentConfig(
-            system_instruction=get_hr_instruction(), # FIX 2: Dynamic date injected
+            system_instruction=get_hr_instruction(),
             temperature=0.0,
             response_mime_type="application/json",
             response_schema=CandidateProfile,
@@ -276,18 +279,50 @@ async def upload_and_parse_resume(file: UploadFile = File(...)):
             config=config
         )
 
-        # Safe JSON parsing
         candidate_data = clean_json_response(response.text)
-
-        candidate_data["candidate_id"] = candidate_id
+        
+        # Attach new file metadata
         candidate_data["resume_url"] = resume_url
         candidate_data["resume_storage_path"] = storage_blob_path
         candidate_data["original_filename"] = file.filename
-        candidate_data["created_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        candidate_data["status"] = "active"
+        
+        # C. DEDUPLICATION LOGIC: Check for ACTIVE candidates by Email
+        email = candidate_data.get("email", "").strip()
+        existing_active_doc = None
+        
+        if email:
+            # Fetch all past and present profiles with this exact email
+            matches = db.collection("candidates").where("email", "==", email).get()
+            
+            for doc_snapshot in matches:
+                doc_status = doc_snapshot.to_dict().get("status", "")
+                
+                # If they already have an ongoing active/pending profile, we flag it to be updated.
+                # If the status is "Hired" or "Reject", we ignore it so a fresh profile gets created.
+                if doc_status not in ["Hired", "Reject"]:
+                    existing_active_doc = doc_snapshot
+                    break
 
-        db.collection("candidates").document(candidate_id).set(candidate_data)
+        if existing_active_doc:
+            # UPDATE EXISTING ONGOING CANDIDATE
+            candidate_id = existing_active_doc.id
+            candidate_data["candidate_id"] = candidate_id
+            candidate_data["updated_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Merge prevents overwriting existing internal notes
+            db.collection("candidates").document(candidate_id).set(candidate_data, merge=True)
+            message = "Candidate already has an active profile. Updated with new resume data."
+        else:
+            # CREATE NEW CANDIDATE (First time applying, OR previously Hired/Rejected)
+            candidate_id = temp_storage_id # Reuse the generated ID
+            candidate_data["candidate_id"] = candidate_id
+            candidate_data["created_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            candidate_data["status"] = "active"
+            
+            db.collection("candidates").document(candidate_id).set(candidate_data)
+            message = "New application profile created successfully."
 
+        # Clean up temporary Gemini uploaded file reference
         try:
             client.files.delete(name=uploaded_doc.name)
         except Exception:
@@ -295,7 +330,7 @@ async def upload_and_parse_resume(file: UploadFile = File(...)):
 
         return {
             "status": "success",
-            "message": "Resume uploaded, parsed, and saved to Firestore successfully.",
+            "message": message,
             "candidate_id": candidate_id,
             "data": candidate_data
         }
