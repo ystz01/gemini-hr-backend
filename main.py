@@ -69,6 +69,8 @@ class ProjectInfo(BaseModel):
     description: str = Field(description="Brief overview, technologies used, or outcome of the project")
 
 class CandidateProfile(BaseModel):
+    is_valid_resume: bool = Field(description="Set to True if the document is a resume/CV. " \
+    "Set to False if it is a random document, menu, image, or unrelated text.")
     name: str = Field(description="Full name of candidate")
     email: Optional[str] = Field(default="", description="Email address")
     phone: Optional[str] = Field(default="", description="Phone number")
@@ -135,10 +137,11 @@ def get_hr_instruction():
 You are an expert HR Talent Acquisition Specialist and Senior Technical Recruiter.
 Today's date is {current_date}. 
 Rules:
-1. Always normalize 'education_level' strictly into: 'High School', 'Diploma', 'Bachelor', 'Master', or 'PhD'.
-2. Aggregate work history durations accurately into 'years_of_experience' as a float. Use today's date for 'Present' roles.
-3. Be strictly factual; never hallucinate unstated skills, projects, or achievements.
-4. When evaluating candidates against job requirements, strictly check hard criteria (required skills, minimum experience years, education).
+1. FIRST, determine if the uploaded document is actually a resume, CV, or professional profile. If it is NOT (e.g., it's a receipt, manual, or random image), set `is_valid_resume` to False and leave other fields blank.
+2. Always normalize 'education_level' strictly into: 'High School', 'Diploma', 'Bachelor', 'Master', or 'PhD'.
+3. Aggregate work history durations accurately into 'years_of_experience' as a float. Use today's date for 'Present' roles.
+4. Be strictly factual; never hallucinate unstated skills, projects, or achievements.
+5. When evaluating candidates against job requirements, strictly check hard criteria (required skills, minimum experience years, education).
 """
 
 def clean_json_response(raw_text: str) -> dict:
@@ -281,6 +284,18 @@ async def upload_and_parse_resume(file: UploadFile = File(...)):
 
         candidate_data = clean_json_response(response.text)
         
+        # Check if it's a valid resume
+        if not candidate_data.get("is_valid_resume", True):
+            # Delete the useless file from Firebase Storage
+            blob.delete()
+            # Delete from Gemini
+            try:
+                client.files.delete(name=uploaded_doc.name)
+            except Exception:
+                pass
+            # Throw error to the frontend
+            raise HTTPException(status_code=400, detail="The uploaded file does not appear to be a valid resume or CV. Please upload a correct document.")
+    
         # Attach new file metadata
         candidate_data["resume_url"] = resume_url
         candidate_data["resume_storage_path"] = storage_blob_path
