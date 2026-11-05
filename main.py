@@ -277,7 +277,7 @@ async def upload_and_parse_resume(file: UploadFile = File(...)):
         )
 
         response = client.models.generate_content(
-            model="gemini-3.6-flash",
+            model="gemini-3.1-flash-lite",
             contents=[uploaded_doc, "Analyze this resume and extract candidate profile details, projects, awards, and portfolios."],
             config=config
         )
@@ -422,7 +422,7 @@ Task:
 """
 
         response = client.models.generate_content(
-            model="gemini-3.6-flash",
+            model="gemini-3.1-flash-lite",
             contents=prompt,
             config=config
         )
